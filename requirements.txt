@@ -1,0 +1,7 @@
+pyrealsesnse2
+json_repair
+
+# for qwen2.5-vl
+qwen-vl-utils[decord]
+transformers==4.51.3
+accelerate
