@@ -2,22 +2,59 @@ from typing import Tuple,List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-import cv2
 from matplotlib.patches import Rectangle
-import os
 
-os.environ['DISPLAY'] = "109.105.4.86:1.0"
+# os.environ['DISPLAY'] = "109.105.4.86:1.0"
+
+
+def add_mask(mask, image):
+    # Get unique object IDs from the mask (excluding background 0)
+    unique_ids = np.unique(mask)
+
+    # Create an RGBA overlay with the same spatial dimensions as the mask
+    overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
+
+    # Assign colors from tab10 colormap to each object ID
+    for obj_id in unique_ids:
+        if obj_id == 0:
+            continue  # Skip background
+        color = plt.cm.tab10((obj_id % 10) / 10)
+        overlay[mask == obj_id] = [*color[:3], 0.5]  # RGBA with 50% alpha
+
+    # Convert input image to float32 [0,1] range
+    if image.dtype == np.uint8:
+        image = image.astype(np.float32) / 255.0
+    else:
+        image = image.astype(np.float32)
+
+    # Add alpha channel if needed
+    if image.shape[-1] == 3:
+        image_rgba = np.concatenate(
+            [image, np.ones((*image.shape[:2], 1), dtype=np.float32)], axis=-1
+        )
+    else:
+        image_rgba = image
+
+    # Alpha blending
+    alpha = overlay[..., 3:]
+    blended_image = image_rgba * (1 - alpha) + overlay * alpha
+
+    # Convert to BGR and ensure uint8 output for video writing
+    blended_bgr = blended_image[..., :3][..., ::-1]  # RGB -> BGR
+    return (blended_bgr * 255).astype(np.uint8)
+
 
 def visualize(
     image: np.ndarray,
     bboxes: Optional[List[List[int]]] = None,
     mask: Optional[np.ndarray] = None,
     save_path: Optional[str] = None,
-    dpi: int = 100
+    dpi: int = 100,
+    return_result: bool = False,
 ) -> None:
     """
     可视化图像、边界框和mask
-    
+
     参数:
     image: RGB格式的输入图像 [H, W, 3]
     bboxes: 边界框列表 [[x1, y1, x2, y2], ...]
@@ -29,23 +66,29 @@ def visualize(
     fig, axs = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle("Visualization Results", fontsize=16)
     axes = axs.flatten()
-    
+
     # 子图1: 原始图像
     axes[0].imshow(image)
     axes[0].set_title("Original Image")
-    axes[0].axis('off')
-    
+    axes[0].axis("off")
+
     # 子图2: 带边界框的图像
     axes[1].imshow(image)
     if bboxes:
         for bbox in bboxes:
             x1, y1, x2, y2 = bbox
-            rect = Rectangle((x1, y1), x2-x1, y2-y1,
-                             linewidth=2, edgecolor='r', facecolor='none')
+            rect = Rectangle(
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                linewidth=2,
+                edgecolor="r",
+                facecolor="none",
+            )
             axes[1].add_patch(rect)
     axes[1].set_title("With Bounding Boxes")
-    axes[1].axis('off')
-    
+    axes[1].axis("off")
+
     # 子图3: 单独mask
     if mask is not None:
         # 生成彩色mask (忽略0背景)
@@ -54,15 +97,17 @@ def visualize(
         for obj_id in unique_ids:
             if obj_id == 0:
                 continue
-            color = plt.cm.get_cmap('tab10')(obj_id % 10)[:3]  # 使用tab10颜色循环
+            color = plt.cm.get_cmap("tab10")(obj_id % 10)[
+                :3
+            ]  # 使用tab10颜色循环
             colored_mask[mask == obj_id] = np.array(color) * 255
         axes[2].imshow(colored_mask)
         axes[2].set_title("Segmentation Mask")
     else:
         axes[2].imshow(np.zeros_like(image))
         axes[2].set_title("No Mask Available")
-    axes[2].axis('off')
-    
+    axes[2].axis("off")
+
     # 子图4: 叠加mask的图像
     axes[3].imshow(image)
     if mask is not None:
@@ -71,69 +116,76 @@ def visualize(
         for obj_id in unique_ids:
             if obj_id == 0:
                 continue
-            color = plt.cm.get_cmap('tab10')(obj_id % 10)
+            color = plt.cm.get_cmap("tab10")(obj_id % 10)
             overlay[mask == obj_id] = [*color[:3], 0.5]  # RGBA格式
-        
+
         axes[3].imshow(overlay)
     axes[3].set_title("Image with Mask Overlay")
-    axes[3].axis('off')
-    
+    axes[3].axis("off")
+
     # 调整布局
     plt.tight_layout()
-    
+
     # 保存或显示
     if save_path:
-        plt.savefig(save_path, bbox_inches='tight', dpi=dpi)
+        plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
         print(f"Visualization saved to {save_path}")
     else:
         plt.show()
-    
+
     plt.close()
+    if return_result:
+        return overlay
+
+
 def compute_mask_centers(
-    mask: np.ndarray,
-    method: str = 'centroid'
+    mask: np.ndarray, method: str = "centroid"
 ) -> List[Tuple[float, float]]:
     """
     计算多目标mask中每个对象的中心点
-    
+
     参数:
     mask: 多目标mask数组，每个像素值为对象ID (0表示背景)
     method: 中心计算方法，可选'centroid'（质心）或'bounding_box'（边界框中心）
-    
+
     返回:
     中心点坐标列表 [(x1, y1), (x2, y2), ...]，按对象ID升序排列
     """
     centers = []
     unique_ids = np.unique(mask)
-    
+
     for obj_id in unique_ids:
         if obj_id == 0:
             continue  # 跳过背景
-        
-        if method == 'centroid':
+
+        if method == "centroid":
             # 计算质心：所有像素坐标的平均值
             y_indices, x_indices = np.where(mask == obj_id)
             cx = np.mean(x_indices)
             cy = np.mean(y_indices)
-            
-        elif method == 'bounding_box':
+
+        elif method == "bounding_box":
             # 计算边界框中心：包围盒的几何中心
-            obj_region = (mask == obj_id)
+            obj_region = mask == obj_id
             rows = np.any(obj_region, axis=1)
             cols = np.any(obj_region, axis=0)
-            
+
             ymin, ymax = np.where(rows)[0][[0, -1]]
             xmin, xmax = np.where(cols)[0][[0, -1]]
-            
+
             cx = (xmin + xmax) / 2.0
             cy = (ymin + ymax) / 2.0
-            
+
         else:
-            raise ValueError(f"Unsupported method: {method}. Choose 'centroid' or 'bounding_box'")
-        
+            raise ValueError(
+                f"Unsupported method: {method}. Choose 'centroid' or 'bounding_box'"
+            )
+
         centers.append((cx, cy))
-    
+
     return centers
+
+
 def visualize_centers(
     image: np.ndarray,
     centers: List[Tuple[float, float]],
