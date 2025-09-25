@@ -1,4 +1,4 @@
-pyrealsesnse2
+pyrealsense2
 json_repair
 
 # for qwen2.5-vl
