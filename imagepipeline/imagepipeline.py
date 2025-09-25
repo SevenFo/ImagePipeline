@@ -3,42 +3,68 @@ import json_repair
 import cv2
 import numpy as np
 import base64
-import pyrealsense2 as rs
 from PIL import Image
-from segment_anything import sam_model_registry, SamPredictor
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
 from torchvision.transforms.functional import to_tensor
 from io import BytesIO
+from hydra import initialize
+from hydra.core.global_hydra import GlobalHydra
 
 from utils import visualize, compute_mask_centers, visualize_centers
 from model_adapters import QwenVLAdapter
 
+try:
+    import pyrealsense2 as rs
+
+    REALSENSE_AVAILABLE = True
+except ImportError:
+    REALSENSE_AVAILABLE = False
+    print("Realsense library not available. Skipping RealsenseCamera functionality.")
+
 
 class ImagePipeline:
     def __init__(
-        self, sam_checkpoint: str, sam_model_type: str, cutie_model, vl_adapter
+        self, sam_checkpoint: str, sam_model_config: str, cutie_model, vl_adapter
     ):
         """
         多目标分割与跟踪管道（集成视觉语言模型）
 
         参数:
         sam_checkpoint: SAM模型权重路径
-        sam_model_type: SAM模型类型 (e.g. "vit_h")
+        sam_model_config: SAM模型类型配置 (i.e. "configs/sam2.1/sam2.1_hiera_l.yaml")
         cutie_model: 预加载的CUTIE模型实例
         vl_adapter: 视觉语言模型适配器实例（QwenVLAdapter）
         """
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
-        # 初始化SAM
-        self.sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
-        self.sam.to(self.device)
-        self.predictor = SamPredictor(self.sam)
+        try:
+            # 清除Hydra状态
+            if GlobalHydra().is_initialized():
+                GlobalHydra.instance().clear()
 
-        # 初始化CUTIE
-        self.cutie = cutie_model
+            # 重新初始化Hydra，使用相对路径
+            with initialize(version_base=None, config_path="pkg://sam2"):
+                self.predictor = SAM2ImagePredictor(
+                    build_sam2(sam_model_config, sam_checkpoint, device=self.device)
+                )
+        except Exception as e:
+            print(f"SAM2 initialization error: {e}")
+            # 备用方案：尝试不同的相对路径
+            try:
+                GlobalHydra.instance().clear()
+                with initialize(version_base=None, config_path="../../sam2/sam2"):
+                    self.predictor = SAM2ImagePredictor(
+                        build_sam2(sam_model_config, sam_checkpoint, device=self.device)
+                    )
+            except Exception as e2:
+                print(f"Backup SAM2 initialization also failed: {e2}")
+                raise
+
+        # 初始化CUTIE - 确保模型在正确设备上
+        self.cutie = cutie_model.to(self.device)
         self.processor = InferenceCore(self.cutie, cfg=self.cutie.cfg)
         self.processor.max_internal_size = -1
 
@@ -83,9 +109,7 @@ class ImagePipeline:
         input_data = self.vl_adapter.prepare_input(
             text=prompt, image_url=f"data:image/jpeg;base64,{base64_image}"
         )
-        response, _ = self.vl_adapter.generate_response(
-            input_data, max_tokens=512
-        )
+        response, _ = self.vl_adapter.generate_response(input_data, max_tokens=512)
 
         print(f"response from vl: {response}")
 
@@ -100,9 +124,7 @@ class ImagePipeline:
             for item in bbox_list:
                 bbox = item.get("bbox_2d", [])
                 if len(bbox) == 4 and all(
-                    0 <= v <= frame.shape[1]
-                    if i % 2 == 0
-                    else 0 <= v <= frame.shape[0]
+                    0 <= v <= frame.shape[1] if i % 2 == 0 else 0 <= v <= frame.shape[0]
                     for i, v in enumerate(bbox)
                 ):
                     valid_bboxes.append(bbox)
@@ -129,9 +151,7 @@ class ImagePipeline:
             raise ValueError("No valid bounding boxes detected by VL model")
 
         # Step 2: SAM生成mask
-        return self.initialize_masks(
-            frame, bboxes
-        ), None if not return_bbox else bboxes
+        return self.initialize_masks(frame, bboxes), None if not return_bbox else bboxes
 
     def initialize_masks(self, frame: np.ndarray, bboxes: list) -> np.ndarray:
         """
@@ -146,22 +166,26 @@ class ImagePipeline:
         """
         # 转换颜色空间并设置SAM图像
         rgb_frame = frame
-        self.predictor.set_image(rgb_frame)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.predictor.set_image(rgb_frame)
 
-        # 生成并组合多个目标的mask
-        combined_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        object_ids = []
-        for obj_idx, bbox in enumerate(bboxes):
-            # SAM预测最佳mask
-            masks, scores, _ = self.predictor.predict(
-                box=np.array(bbox), multimask_output=True
-            )
-            best_mask = masks[np.argmax(scores)]
+            # 生成并组合多个目标的mask
+            combined_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            object_ids = []
+            for obj_idx, bbox in enumerate(bboxes):
+                # SAM预测最佳mask
+                masks, scores, _ = self.predictor.predict(
+                    box=np.array(bbox), multimask_output=True
+                )
+                best_mask = masks[np.argmax(scores)]
 
-            # 分配唯一对象ID (从1开始)
-            obj_id = obj_idx + 1
-            combined_mask[best_mask] = obj_id
-            object_ids.append(obj_id)
+                # 确保mask是布尔类型
+                best_mask = best_mask.astype(bool)
+
+                # 分配唯一对象ID (从1开始)
+                obj_id = obj_idx + 1
+                combined_mask[best_mask] = obj_id
+                object_ids.append(obj_id)
 
         # 初始化CUTIE处理器
         mask_tensor = torch.from_numpy(combined_mask).to(self.device)
@@ -187,9 +211,7 @@ class ImagePipeline:
         list: 每个目标的二值mask列表 [mask1, mask2, ...]
         """
         if not self.is_initialized:
-            raise RuntimeError(
-                "Pipeline not initialized. Call initialize_masks first."
-            )
+            raise RuntimeError("Pipeline not initialized. Call initialize_masks first.")
 
         # 准备输入数据
         rgb_frame = frame
@@ -233,15 +255,13 @@ class ImagePipeline:
 
         # 分配新ID
         new_id = max(self.current_objects) + 1 if self.current_objects else 1
-        new_mask_tensor = torch.from_numpy(
-            new_mask.astype(np.uint8) * new_id
-        ).to(self.device)
+        new_mask_tensor = torch.from_numpy(new_mask.astype(np.uint8) * new_id).to(
+            self.device
+        )
 
         # 合并到现有mask
         combined_mask = self.processor.output_prob_to_mask(self.processor.prob)
-        combined_mask = torch.where(
-            new_mask_tensor > 0, new_mask_tensor, combined_mask
-        )
+        combined_mask = torch.where(new_mask_tensor > 0, new_mask_tensor, combined_mask)
 
         # 更新处理器状态
         self.current_objects.append(new_id)
@@ -288,8 +308,8 @@ def main_rs(
         raise ValueError("video_path is required when video_source is 'video'")
 
     # 初始化所有模型
-    sam_checkpoint = "/data/shiqi/ImagePipelien/sam_vit_h_4b8939.pth"
-    sam_model_type = "vit_h"
+    sam_checkpoint = "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"
+    sam_model_config = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
     # 初始化视频源
     camera = None
@@ -329,8 +349,9 @@ def main_rs(
             vl_adapter = QwenVLAdapter(
                 model_path="/data/model/Qwen/Qwen2.5-VL-3B-Instruct"
             )
+
             pipeline = ImagePipeline(
-                sam_checkpoint, sam_model_type, cutie_model, vl_adapter
+                sam_checkpoint, sam_model_config, cutie_model, vl_adapter
             )
 
         # 初始化标志
@@ -351,17 +372,13 @@ def main_rs(
                 if not disable_vlm:
                     if not initialized:
                         # 使用第一帧进行初始化
-                        combined_mask, bboxes = (
-                            pipeline.initialize_with_instruction(
-                                frame=rgb_frame,
-                                instruction="lemon",
-                                return_bbox=True,
-                            )
+                        combined_mask, bboxes = pipeline.initialize_with_instruction(
+                            frame=rgb_frame,
+                            instruction="lemon",
+                            return_bbox=True,
                         )
                         initialized = True
-                        centers = compute_mask_centers(
-                            combined_mask, "centroid"
-                        )
+                        centers = compute_mask_centers(combined_mask, "centroid")
                         updated_mask = combined_mask
                     else:
                         # 更新掩码
@@ -421,8 +438,8 @@ def main_rs_iter(
         raise ValueError("video_path is required when video_source is 'video'")
 
     # 初始化所有模型
-    sam_checkpoint = "/data/shiqi/ImagePipelien/sam_vit_h_4b8939.pth"
-    sam_model_type = "vit_h"
+    sam_checkpoint = "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"
+    sam_model_config = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
     # 初始化视频源
     camera = None
@@ -484,17 +501,13 @@ def main_rs_iter(
                 if not disable_vlm:
                     if not initialized:
                         # 使用第一帧进行初始化
-                        combined_mask, bboxes = (
-                            pipeline.initialize_with_instruction(
-                                frame=rgb_frame,
-                                instruction="Strawberry",
-                                return_bbox=True,
-                            )
+                        combined_mask, bboxes = pipeline.initialize_with_instruction(
+                            frame=rgb_frame,
+                            instruction="Strawberry",
+                            return_bbox=True,
                         )
                         initialized = True
-                        centers = compute_mask_centers(
-                            combined_mask, "centroid"
-                        )
+                        centers = compute_mask_centers(combined_mask, "centroid")
                         updated_mask = combined_mask
                     else:
                         # 更新掩码
@@ -538,45 +551,64 @@ def main_rs_iter(
 
 def main_demo():
     # 初始化所有模型
-    sam_checkpoint = "/data/shiqi/ImagePipelien/sam_vit_h_4b8939.pth"
-    sam_model_type = "vit_h"
-    vl_adapter = QwenVLAdapter(model_path="/data/model/Qwen/Qwen2.5-VL-3B-Instruct")
+    sam_checkpoint = "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"
+    sam_model_config = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    vl_adapter = QwenVLAdapter(model_path="/quick_data/model_qwen2.5_vl_7b_instruct")
+    print("vl_adapter initialized")
     with torch.no_grad():
-        cutie_model = get_default_model()
+        try:
+            cutie_model = get_default_model()
+        except ValueError as e:
+            if "GlobalHydra is already initialized" in str(e):
+                GlobalHydra.instance().clear()
+                cutie_model = get_default_model()
+            else:
+                raise
+        print("Cuite model loaded successfully")
         # 创建增强版管道
-        pipeline = ImagePipeline(sam_checkpoint, sam_model_type, cutie_model, vl_adapter)
-        
+        pipeline = ImagePipeline(
+            sam_checkpoint, sam_model_config, cutie_model, vl_adapter
+        )
+        print("Pipeline initialized successfully")
         # 通过自然语言指令初始化
-        frame = cv2.imread("erqa.png")
-        rgb_frame=  frame[:,:,::-1].copy()
+        frame = cv2.imread(
+            "logs/20250530_005948/1_0_monitor_assemble_object_input_1.png"
+        )
+        rgb_frame = frame[:, :, ::-1].copy()
         combined_mask, bboxes = pipeline.initialize_with_instruction(
             frame=frame,
-            instruction="lemon",  # 自然语言指令
+            instruction="robot arm",  # 自然语言指令
             return_bbox=True,
         )
-        
+
         # 可视化结果
-        visualize(frame,bboxes=bboxes, mask=combined_mask)
-        centers = compute_mask_centers(combined_mask,'centroid')
+        visualize(frame, bboxes=bboxes, mask=combined_mask)
+        centers = compute_mask_centers(combined_mask, "centroid")
         visualize_centers(frame, centers=centers)
         # 后续跟踪流程...
         for _ in range(10):
             new_frame = rgb_frame  # 获取新帧
             updated_mask, _ = pipeline.update_masks(new_frame)
-            centers = compute_mask_centers(updated_mask,'centroid')
+            centers = compute_mask_centers(updated_mask, "centroid")
             visualize(new_frame, mask=updated_mask)
             visualize_centers(new_frame, centers=centers)
-    
+
+
 # 使用示例
 if __name__ == "__main__":
     # setup_all()
 
-    for centers in main_rs_iter(
-        save_video=False,
-        disable_vlm=False,
-        video_source="camera",
-        video_path="/data/shiqi/ImagePipelien/imagepipeline/output.mp4",
-    ):
-        print(centers)
+    # for centers in main_rs_iter(
+    #     save_video=False,
+    #     disable_vlm=False,
+    #     video_source="camera",
+    #     video_path="/data/shiqi/ImagePipelien/imagepipeline/output.mp4",
+    # ):
+    #     print(centers)
+
+    import os
+
+    os.environ["DISPLAY"] = ":0"  # 设置显示环境变量
+    main_demo()
 
     # shutdown_all()
